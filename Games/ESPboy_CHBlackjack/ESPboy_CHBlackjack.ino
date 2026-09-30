@@ -11,7 +11,7 @@ ESPboyInit myESPboy;
 
 void setup() {
     Serial.begin(115200);
-    myESPboy.begin("CHBlackjack");
+    myESPboy.begin("CHblackjack");
 
     Serial.println();
     Serial.println(ESP.getFreeHeap()); 
