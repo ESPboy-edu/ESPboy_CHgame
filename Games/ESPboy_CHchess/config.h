@@ -24,7 +24,7 @@
 // tests never need (saving, the options screen and its credits). The
 // simulator (not flash-bound) and release builds keep everything.
 //#if CHCH_DEBUG && !defined(CHSIM) && !defined(CHCH_FULL)
-#define CHCH_LEAN        1
+#define CHCH_LEAN        0
 //#else
 //#define CHCH_LEAN        0
 //#endif

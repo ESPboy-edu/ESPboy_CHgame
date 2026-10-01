@@ -1,26 +1,24 @@
-#pragma GCC optimize("Os")   // cold code: size over speed
+#pragma GCC optimize("Os")
 #include <Arduino.h>
+#include <EEPROM.h>
 #include <string.h>
-#include "../gfx/ESPboyGfx.h"
 #include "../../config.h"
-#include "../RamFunc.h"
 #include "Save.h"
 
 namespace save {
 
 #if CHCH_LEAN
-// Device debug builds (the serial protocol) don't fit with this code and a
-// page left over to save in, so saving is left out of them.
+// Если включен режим LEAN, сохранения отключаются
 bool available() { return false; }
 bool load(Options &, Stats &, bool &hasGame) { hasGame = false; return false; }
 bool loadGame() { return false; }
 bool store(const Options &, const Stats &, bool) { return false; }
 #else
-static const uint32_t MAGIC = 0x53434843u;       // "CHCS"
-static const uint8_t VERSION = 2;              // 2: three opponents
-static const uint32_t PAGE = 256;
-static const uint32_t PAGE_A = 0xF500, PAGE_B = 0xF600;   // metadata page is 0xF700
 
+static const uint32_t MAGIC = 0x53434843u;       // "CHCS"
+static const uint8_t VERSION = 2;                // 2: three opponents
+
+// Структура для сохранения (размер около 232 байт)
 struct Record {
     uint32_t magic;
     uint8_t  version, hasGame;
@@ -30,11 +28,11 @@ struct Record {
     match::Record game;
     uint32_t crc;
 };
-static_assert(sizeof(Record) <= PAGE, "save record must fit one flash page");
 
-static uint16_t lastSeq = 0;
-static bool broken = false;
+static bool eeprom_initialized = false;
+static Record currentRecord;
 
+// Оригинальная функция проверки целостности от автора игры
 static uint32_t crc32(const uint8_t *p, uint32_t n) {
     uint32_t c = 0xFFFFFFFFu;
     while (n--) {
@@ -44,124 +42,73 @@ static uint32_t crc32(const uint8_t *p, uint32_t n) {
     return ~c;
 }
 
+// Инициализация сектора EEPROM в Flash-памяти ESP8266 (выделяем 512 байт с запасом)
+static void initEEPROM() {
+    if (!eeprom_initialized) {
+        EEPROM.begin(512); 
+        eeprom_initialized = true;
+    }
+}
+
 static bool valid(const Record *r) {
     return r->magic == MAGIC && r->version == VERSION &&
            r->crc == crc32((const uint8_t *)r, (uint32_t)(sizeof(Record) - 4));
 }
 
-#ifndef CHSIM
-extern "C" uint32_t _data_lma, _data_vma, _edata;
-
-static uint32_t imageEnd() {
-    return (uint32_t)&_data_lma + ((uint32_t)&_edata - (uint32_t)&_data_vma);
-}
-
-// Flash controller, mirrored from CH32SerialBoot/bootloader/src/flash.c.
-// Must run from SRAM, with interrupts off (the vector table is in flash).
-#define CR_STRT 0x00000040u
-#define CR_FLOCK 0x00008000u
-#define CR_PAGE_PG 0x00010000u
-#define CR_PAGE_ER 0x00020000u
-#define CR_BUF_LOAD 0x00040000u
-#define CR_BUF_RST 0x00080000u
-#define SR_BSY 0x00000001u
-#define PROG(a) ((a) + 0x08000000u)
-
-RAMFUNC(save) static void pageWrite(uint32_t addr, const uint32_t *w) {
-    uint32_t irq;
-    __asm volatile("csrr %0, 0x800" : "=r"(irq));
-    __asm volatile("csrw 0x800, %0" : : "r"(irq & ~0x88u));
-    FLASH->KEYR = 0x45670123u; FLASH->KEYR = 0xCDEF89ABu;
-    FLASH->MODEKEYR = 0x45670123u; FLASH->MODEKEYR = 0xCDEF89ABu;
-    FLASH->CTLR |= CR_PAGE_ER;
-    FLASH->ADDR = PROG(addr);
-    FLASH->CTLR |= CR_STRT;
-    while (FLASH->STATR & SR_BSY) {}
-    FLASH->CTLR &= ~CR_PAGE_ER;
-    FLASH->CTLR |= CR_PAGE_PG;
-    FLASH->CTLR |= CR_BUF_RST;
-    while (FLASH->STATR & SR_BSY) {}
-    FLASH->CTLR &= ~CR_PAGE_PG;
-    for (uint32_t i = 0; i < PAGE / 4; i++) {
-        FLASH->CTLR |= CR_PAGE_PG;
-        *(volatile uint32_t *)(PROG(addr) + i * 4) = w[i];
-        FLASH->CTLR |= CR_BUF_LOAD;
-        while (FLASH->STATR & SR_BSY) {}
-        FLASH->CTLR &= ~CR_PAGE_PG;
-    }
-    FLASH->CTLR |= CR_PAGE_PG;
-    FLASH->ADDR = PROG(addr);
-    FLASH->CTLR |= CR_STRT;
-    while (FLASH->STATR & SR_BSY) {}
-    FLASH->CTLR &= ~CR_PAGE_PG;
-    FLASH->CTLR |= CR_FLOCK;
-    __asm volatile("csrw 0x800, %0" : : "r"(irq));
-}
-
-// Two pages when the image leaves room for them, else just the last one.
-static bool twoPages() { return imageEnd() <= PAGE_A; }
-bool available() { return !broken && imageEnd() <= PAGE_B; }
-
-static const Record *page(uint32_t a) { return (const Record *)a; }
-
-static bool writePage(uint32_t addr, const uint8_t *buf) {
-    pageWrite(addr, (const uint32_t *)buf);
-    return memcmp((const void *)addr, buf, PAGE) == 0;
-}
-#else
-// Simulator: in-memory "flash" so save/continue flows can be scripted.
-static uint8_t simFlash[2][PAGE];
-bool available() { return !broken; }
-static bool twoPages() { return true; }
-static const Record *page(uint32_t a) { return (const Record *)simFlash[a == PAGE_B]; }
-static bool writePage(uint32_t addr, const uint8_t *buf) {
-    memcpy(simFlash[addr == PAGE_B], buf, PAGE);
-    return true;
-}
-#endif
-
-static const Record *best() {
-    if (!available()) return nullptr;
-    const Record *a = page(PAGE_A), *b = page(PAGE_B);
-    bool va = twoPages() && valid(a), vb = valid(b);
-    if (va && vb) return (int16_t)(a->seq - b->seq) > 0 ? a : b;
-    return va ? a : (vb ? b : nullptr);
+bool available() { 
+    return true; 
 }
 
 bool load(Options &o, Stats &s, bool &hasGame) {
+    initEEPROM();
     hasGame = false;
-    const Record *r = best();
-    if (!r) return false;
-    lastSeq = r->seq;
-    o = r->opt;
-    s = r->stats;
-    hasGame = r->hasGame != 0;
+    
+    // Читаем данные из EEPROM начиная с адреса 0
+    EEPROM.get(0, currentRecord);
+    
+    if (!valid(&currentRecord)) {
+        return false; // Сохранений еще нет или они повреждены
+    }
+    
+    o = currentRecord.opt;
+    s = currentRecord.stats;
+    hasGame = currentRecord.hasGame != 0;
     return true;
 }
 
 bool loadGame() {
-    const Record *r = best();
-    return r && r->hasGame && match::load(r->game);
+    initEEPROM();
+    EEPROM.get(0, currentRecord);
+    if (valid(&currentRecord) && currentRecord.hasGame) {
+        return match::load(currentRecord.game);
+    }
+    return false;
 }
 
 bool store(const Options &o, const Stats &s, bool withGame) {
-    if (!available()) return false;
-    uint8_t *buf = gfx_chunkScratch();          // idle between gfx_wait() and the next flush
-    memset(buf, 0xFF, PAGE);
-    Record &rec = *(Record *)buf;
-    rec.magic = MAGIC;
-    rec.version = VERSION;
-    rec.seq = (uint16_t)(lastSeq + 1);
-    rec.opt = o;
-    rec.stats = s;
-    rec.hasGame = withGame ? 1 : 0;
-    if (withGame) match::save(rec.game);
-    rec.crc = crc32(buf, (uint32_t)(sizeof rec - 4));
-    uint32_t addr = ((rec.seq & 1) || !twoPages()) ? PAGE_B : PAGE_A;   // alternate pages
-    if (!writePage(addr, buf)) { broken = true; return false; }
-    lastSeq = rec.seq;
-    return true;
+    initEEPROM();
+    
+    currentRecord.magic = MAGIC;
+    currentRecord.version = VERSION;
+    currentRecord.seq++; // Просто увеличиваем счетчик
+    currentRecord.opt = o;
+    currentRecord.stats = s;
+    currentRecord.hasGame = withGame ? 1 : 0;
+    
+    if (withGame) {
+        match::save(currentRecord.game);
+    }
+    
+    // Считаем контрольную сумму
+    currentRecord.crc = crc32((const uint8_t *)&currentRecord, (uint32_t)(sizeof(Record) - 4));
+    
+    // Записываем структуру и вызываем commit() для физического сохранения во Flash
+    EEPROM.put(0, currentRecord);
+    bool success = EEPROM.commit();
+    
+    return success;
 }
+
 #endif
 
 }  // namespace save
