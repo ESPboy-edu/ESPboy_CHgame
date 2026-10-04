@@ -7,14 +7,25 @@
 
 #include "ESPboyInit.h"
 
+//#include "ESPboyTerminalGUI.h"
+//#include "ESPboyOTA2.h"
+
 ESPboyInit myESPboy;
 
 void setup() {
-    Serial.begin(115200);
+    //Serial.begin(115200);
     myESPboy.begin("CHblackjack");
 
-    Serial.println();
-    Serial.println(ESP.getFreeHeap()); 
+  //Check OTA2
+  /*
+  if (myESPboy.getKeys()&PAD_ACT || myESPboy.getKeys()&PAD_ESC) { 
+     ESPboyTerminalGUI *terminalGUIobj = new ESPboyTerminalGUI(&myESPboy.tft, &myESPboy.mcp);
+     ESPboyOTA2 *OTA2obj = new ESPboyOTA2(terminalGUIobj);
+  }
+*/
+
+    //Serial.println();
+    //Serial.println(ESP.getFreeHeap()); 
     
     EEPROM.begin(512);
 
